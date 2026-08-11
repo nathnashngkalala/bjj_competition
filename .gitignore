@@ -1,0 +1,18 @@
+cat << 'EOF' > .gitignore
+# Virtual environment
+venv/
+.venv/
+
+# Large media files and logs
+*.mp4
+*.avi
+*.log
+process.log
+nohup.out
+
+# Python cache and OS files
+__pycache__/
+*.pyc
+.DS_Store
+.env
+EOF
