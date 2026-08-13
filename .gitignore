@@ -5,6 +5,7 @@ venv/
 
 # Large media files and logs
 *.mp4
+*.mp4.part
 *.avi
 *.log
 process.log

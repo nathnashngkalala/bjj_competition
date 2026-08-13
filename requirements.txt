@@ -1,0 +1,6 @@
+easyocr
+opencv-python
+yt-dlp
+google-genai
+tqdm
+torch
