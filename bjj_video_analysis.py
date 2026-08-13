@@ -4,15 +4,105 @@ import os
 import cv2
 import easyocr
 import subprocess
+import json
+import re
+from tqdm import tqdm
 from google import genai
 
-# Initialize EasyOCR reader (runs locally)
-reader = easyocr.Reader(['en'], gpu=False)
+# Auto-detect CUDA GPU availability if PyTorch is present
+try:
+    import torch
+    use_gpu = torch.cuda.is_available()
+except ImportError:
+    use_gpu = False
+
+print(f"⚡ Initializing EasyOCR (GPU: {use_gpu})...")
+reader = easyocr.Reader(['en'], gpu=use_gpu)
+CHECKPOINT_FILE = "scan_checkpoint.json"
 
 
-def download_stream(youtube_url, output_path="full_stream.mp4"):
-    """Downloads the YouTube stream via yt-dlp and benchmarks download time."""
-    print(f"\n[1/4] Downloading YouTube Stream...")
+def extract_youtube_id(url):
+    """Extracts the 11-character YouTube video ID from standard or short URLs."""
+    pattern = r"(?:v=|\/embed\/|\/v\/|youtu\.be\/|\/shorts\/|\/live\/|^)([a-zA-Z0-9_-]{11})"
+    match = re.search(pattern, url)
+    if match:
+        return match.group(1)
+    return None
+
+
+def load_checkpoint(video_path, target_names):
+    """Loads scan progress if a valid checkpoint exists for the current video."""
+    default_data = {
+        "video_path": video_path,
+        "last_frame_idx": 0,
+        "matched_timestamps": {name: [] for name in target_names},
+        "frames_checked": 0
+    }
+    if os.path.exists(CHECKPOINT_FILE):
+        try:
+            with open(CHECKPOINT_FILE, "r") as f:
+                data = json.load(f)
+            if data.get("video_path") == video_path:
+                print(f"🔄 Checkpoint found! Resuming scan from frame {data.get('last_frame_idx', 0)}...")
+                return data
+        except Exception:
+            pass
+    return default_data
+
+
+def save_checkpoint(video_path, last_frame_idx, matched_timestamps, frames_checked):
+    """Saves current scan state to disk."""
+    data = {
+        "video_path": video_path,
+        "last_frame_idx": last_frame_idx,
+        "matched_timestamps": matched_timestamps,
+        "frames_checked": frames_checked
+    }
+    with open(CHECKPOINT_FILE, "w") as f:
+        json.dump(data, f)
+
+
+def clear_checkpoint():
+    """Removes checkpoint file upon successful completion."""
+    if os.path.exists(CHECKPOINT_FILE):
+        os.remove(CHECKPOINT_FILE)
+
+
+def cluster_matches(timestamps, max_gap_sec=120, buffer_sec=20, min_hits=2):
+    """
+    Groups individual detections into distinct matches per athlete.
+    - `max_gap_sec`: Max gap between score detections before starting a new match (120s).
+    - `buffer_sec`: Padding added before/after match start/end (20s).
+    - `min_hits`: Minimum OCR detections required to filter out stray bracket graphics.
+    """
+    if not timestamps:
+        return []
+
+    sorted_ts = sorted(list(set(timestamps)))
+    matches = []
+    current_match = [sorted_ts[0]]
+
+    for ts in sorted_ts[1:]:
+        if ts - current_match[-1] > max_gap_sec:
+            if len(current_match) >= min_hits:
+                start = max(0, current_match[0] - buffer_sec)
+                end = current_match[-1] + buffer_sec
+                matches.append((start, end))
+            current_match = [ts]
+        else:
+            current_match.append(ts)
+
+    if len(current_match) >= min_hits:
+        start = max(0, current_match[0] - buffer_sec)
+        end = current_match[-1] + buffer_sec
+        matches.append((start, end))
+
+    return matches
+
+
+def download_stream(youtube_url, output_path):
+    """Downloads YouTube stream using yt-dlp to a specific filename."""
+    print(f"\n[1/4] 📥 Downloading YouTube Stream to '{output_path}'...")
     start_time = time.perf_counter()
 
     cmd = [
@@ -26,28 +116,43 @@ def download_stream(youtube_url, output_path="full_stream.mp4"):
     elapsed = time.perf_counter() - start_time
     file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
     print(f"✓ Download Complete: {file_size_mb:.2f} MB in {elapsed:.2f}s ({file_size_mb / elapsed:.2f} MB/s)")
-    return output_path, elapsed
+    return output_path
 
 
-def find_match_timestamps(video_path, target_names, frame_interval_sec=5, crop_overlay=False):
+def find_matches_per_athlete(video_path, target_names, frame_interval_sec=30, crop_overlay=False):
     """
-    Scans video frames using OCR to detect athlete names.
-    Includes benchmarking for OCR duration and processing speed.
+    Scans video frames and maps detections separately for each athlete.
+    Uses cap.grab() for fast-forwarding to avoid keyframe seeking failures.
     """
     print(f"\n[2/4] Scanning Video Frames for Athletes: {target_names}...")
     start_time = time.perf_counter()
 
     cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"❌ Error: OpenCV cannot open video file '{video_path}'. Check path and permissions.")
+        return {}, 0.0
+
     fps = cap.get(cv2.CAP_PROP_FPS)
+    if not fps or fps <= 0:
+        fps = 30.0
+
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frame_jump = max(1, int(fps * frame_interval_sec))
 
-    matched_timestamps = []
-    frames_checked = 0
-    frame_idx = 0
+    checkpoint = load_checkpoint(video_path, target_names)
+    frame_idx = checkpoint.get("last_frame_idx", 0)
+    matched_timestamps = checkpoint.get("matched_timestamps", {name: [] for name in target_names})
+    frames_checked = checkpoint.get("frames_checked", 0)
+
+    if frame_idx > 0:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+
+    if total_frames > 0:
+        pbar = tqdm(total=total_frames, initial=frame_idx, unit="frame", desc="Scanning OCR")
+    else:
+        pbar = tqdm(unit="frame", desc="Scanning OCR")
 
     while cap.isOpened():
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
         ret, frame = cap.read()
         if not ret:
             break
@@ -55,48 +160,44 @@ def find_match_timestamps(video_path, target_names, frame_interval_sec=5, crop_o
         frames_checked += 1
         current_sec = frame_idx / fps
 
-        # Optional Optimization: Crop to top/bottom overlay bar where names usually appear
         if crop_overlay:
             h, w, _ = frame.shape
-            # Focus on lower 25% of the screen (adjust as needed for Scrambleclash overlays)
             frame = frame[int(h * 0.75):h, 0:w]
 
-        # Run local OCR
         ocr_results = reader.readtext(frame, detail=0)
         detected_text = " ".join(ocr_results).lower()
 
         for name in target_names:
             if name.lower() in detected_text:
-                matched_timestamps.append(current_sec)
+                if name not in matched_timestamps:
+                    matched_timestamps[name] = []
+                matched_timestamps[name].append(current_sec)
                 mins, secs = int(current_sec // 60), int(current_sec % 60)
-                print(f"  ➜ Match detected for '{name}' at {mins:02d}:{secs:02d}")
+                pbar.write(f"  ➜ Match detected for '{name}' at {mins:02d}:{secs:02d}")
+
+        save_checkpoint(video_path, frame_idx, matched_timestamps, frames_checked)
+
+        for _ in range(frame_jump - 1):
+            if not cap.grab():
+                break
 
         frame_idx += frame_jump
+        pbar.update(frame_jump)
 
+    pbar.close()
     cap.release()
     elapsed = time.perf_counter() - start_time
+    clear_checkpoint()
 
-    # Performance Stats
-    fps_processed = frames_checked / elapsed if elapsed > 0 else 0
-    print(f"✓ OCR Scan Complete:")
-    print(f"  • Total Video Duration: {int(total_frames / fps // 60)}m {int(total_frames / fps % 60)}s")
-    print(f"  • Frames Inspected: {frames_checked}")
-    print(f"  • OCR Processing Speed: {fps_processed:.2f} frames/sec")
-    print(f"  • Time Taken: {elapsed:.2f}s")
+    athlete_match_clips = {}
+    for name, ts_list in matched_timestamps.items():
+        athlete_match_clips[name] = cluster_matches(ts_list)
 
-    if not matched_timestamps:
-        return None, None, elapsed
-
-    start_sec = max(0, min(matched_timestamps) - 30)
-    end_sec = max(matched_timestamps) + 30
-    return start_sec, end_sec, elapsed
+    return athlete_match_clips, elapsed
 
 
-def extract_match_clip(input_video, start_sec, end_sec, output_clip="match_clip.mp4"):
-    """Clips the detected match segment without re-encoding."""
-    print(f"\n[3/4] Trimming Match Clip ({int(start_sec)}s to {int(end_sec)}s)...")
-    start_time = time.perf_counter()
-
+def extract_match_clip(input_video, start_sec, end_sec, output_clip):
+    """Clips a match segment using FFmpeg stream copy without re-encoding."""
     cmd = [
         "ffmpeg", "-y",
         "-ss", str(start_sec),
@@ -106,28 +207,20 @@ def extract_match_clip(input_video, start_sec, end_sec, output_clip="match_clip.
         output_clip
     ]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    elapsed = time.perf_counter() - start_time
-    print(f"✓ Clip Extracted in {elapsed:.2f}s -> {output_clip}")
-    return output_clip, elapsed
+    return output_clip
 
 
-def analyze_match_with_gemini(clip_path, target_names):
-    """Sends clip to Gemini API for multi-athlete technical analysis."""
-    print(f"\n[4/4] Sending Clip to Gemini API for Technical Analysis...")
-    start_time = time.perf_counter()
-
+def analyze_match_with_gemini(clip_path, athlete_name):
+    """Sends clip to Gemini API for technical analysis."""
+    print(f"\n[4/4] Analyzing {clip_path} with Gemini AI...")
     client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
     video_file = client.files.upload(file=clip_path)
 
-    athletes_str = ", ".join(target_names)
     prompt = f"""
-    You are an expert BJJ black belt coach analyzing a tournament video clip.
-    Analyze the match featuring athlete(s): {athletes_str}.
-
+    You are an expert BJJ black belt coach. Analyze this match clip for athlete: {athlete_name}.
     Provide:
-    1. Key Match Highlights & Timestamps (Takedowns, Guards, Passes, Sweeps, Submissions).
-    2. Tactical Breakdown for {athletes_str} (Strengths & mistakes made).
+    1. Key Highlights & Timestamps (Takedowns, Guards, Passes, Sweeps, Submissions).
+    2. Tactical Breakdown for {athlete_name} (Strengths & mistakes made).
     3. Specific Coaching Recommendations to improve position control or submission defenses.
     """
 
@@ -135,54 +228,88 @@ def analyze_match_with_gemini(clip_path, target_names):
         model='gemini-2.5-flash',
         contents=[video_file, prompt]
     )
-
-    elapsed = time.perf_counter() - start_time
-    print(f"✓ Gemini Analysis Completed in {elapsed:.2f}s")
-    return response.text, elapsed
+    return response.text
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Automated BJJ Match Finder & Performance Benchmarker")
-    parser.add_argument("--url", type=str, required=True, help="YouTube livestream video URL")
-    parser.add_argument("--names", type=str, nargs="+", required=True, help="List of athlete names to find (space-separated)")
-    parser.add_argument("--interval", type=int, default=5, help="Scan interval in seconds (default: 5)")
-    parser.add_argument("--crop", action="store_true", help="Enable ROI cropping for faster OCR")
+    parser = argparse.ArgumentParser(description="Automated BJJ Match Finder & Segmenter")
+    parser.add_argument("--url", type=str, required=True, help="YouTube URL or local video path")
+    parser.add_argument("--names", type=str, nargs="+", required=True, help="Athlete names")
+    parser.add_argument("--interval", type=int, default=30, help="Scan interval in seconds (default: 30)")
+    parser.add_argument("--crop", action="store_true", help="Enable ROI cropping for bottom 25% overlay")
 
     args = parser.parse_args()
-
     total_start = time.perf_counter()
 
-    # Pipeline execution
-    video_path, dl_time = download_stream(args.url)
-    start_sec, end_sec, ocr_time = find_match_timestamps(
+    is_url = args.url.startswith("http://") or args.url.startswith("https://")
+
+    if is_url:
+        video_id = extract_youtube_id(args.url)
+        target_filename = f"stream_{video_id}.mp4" if video_id else "full_stream.mp4"
+        
+        # Check if stream already exists locally
+        possible_existing = [target_filename, f"{target_filename}.mkv"]
+        found_file = next((f for f in possible_existing if os.path.exists(f)), None)
+
+        if found_file:
+            print(f"\n[1/4] 💾 Found local video for YouTube ID '{video_id}': '{found_file}'. Skipping download.")
+            video_path = found_file
+        else:
+            video_path = download_stream(args.url, output_path=target_filename)
+    else:
+        # Local file path provided
+        if os.path.exists(args.url):
+            print(f"\n[1/4] 📁 Using local video file: '{args.url}'")
+            video_path = args.url
+        else:
+            print(f"\n❌ Error: Local file '{args.url}' was not found.")
+            video_files = [f for f in os.listdir(".") if f.endswith((".mp4", ".mkv", ".webm", ".avi"))]
+            if video_files:
+                print(f"  ➜ Available video files in current directory: {video_files}")
+            return
+
+    athlete_matches, ocr_time = find_matches_per_athlete(
         video_path, 
         args.names, 
         frame_interval_sec=args.interval, 
         crop_overlay=args.crop
     )
 
-    if start_sec is not None and end_sec is not None:
-        clip_path, clip_time = extract_match_clip(video_path, start_sec, end_sec)
-        breakdown, api_time = analyze_match_with_gemini(clip_path, args.names)
+    print("\n[3/4] Trimming Individual Match Clips...")
+    extracted_clips = []
 
-        total_elapsed = time.perf_counter() - total_start
+    for name, matches in athlete_matches.items():
+        if not matches:
+            print(f"❌ No matches found for '{name}'")
+            continue
 
-        print("\n" + "="*50)
-        print("          AI COACH TECHNICAL BREAKDOWN          ")
-        print("="*50)
-        print(breakdown)
+        print(f"\n Found {len(matches)} match(es) for {name}:")
+        clean_name = name.replace(" ", "_")
 
-        print("\n" + "="*50)
-        print("             PERFORMANCE BENCHMARKS             ")
-        print("="*50)
-        print(f"• Stream Download Time:  {dl_time:.2f}s")
-        print(f"• OCR Search Time:      {ocr_time:.2f}s")
-        print(f"• FFmpeg Clipping Time: {clip_time:.2f}s")
-        print(f"• Gemini API Analysis:  {api_time:.2f}s")
-        print(f"• Total Pipeline Time:  {total_elapsed:.2f}s")
-        print("="*50)
-    else:
-        print("\n❌ Could not locate specified athletes in this stream.")
+        for idx, (start_sec, end_sec) in enumerate(matches, 1):
+            duration = int(end_sec - start_sec)
+            output_filename = f"{clean_name}_match_{idx}.mp4"
+
+            extract_match_clip(video_path, start_sec, end_sec, output_filename)
+            extracted_clips.append((name, output_filename))
+
+            start_m, start_s = int(start_sec // 60), int(start_sec % 60)
+            end_m, end_s = int(end_sec // 60), int(end_sec % 60)
+            print(f"  ✓ Saved: {output_filename} ({start_m:02d}:{start_s:02d} to {end_m:02d}:{end_s:02d} | Duration: {duration}s)")
+
+    if os.environ.get("GEMINI_API_KEY") and extracted_clips:
+        for athlete_name, clip_file in extracted_clips:
+            try:
+                breakdown = analyze_match_with_gemini(clip_file, athlete_name)
+                print(f"\n" + "="*50)
+                print(f"  AI COACH BREAKDOWN: {clip_file}")
+                print("="*50)
+                print(breakdown)
+            except Exception as e:
+                print(f"⚠️ Gemini analysis skipped for {clip_file}: {e}")
+
+    total_elapsed = time.perf_counter() - total_start
+    print(f"\n✅ Pipeline complete in {total_elapsed:.2f}s!")
 
 
 if __name__ == "__main__":
